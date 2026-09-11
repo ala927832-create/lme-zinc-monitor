@@ -1,71 +1,108 @@
 import json
 import os
+import traceback
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 import pandas as pd
 import requests
-import yfinance as yf
 
 
 def fetch_zinc_data():
-    """使用 yf.download 搭配多代碼自動備援，解決 GitHub Actions IP 阻擋與代碼失效問題"""
-    # 備援代碼清單：ZNC=F (LME鋅期貨), ZNC.L (倫敦鋅), SZI=F (上海鋅期貨折算)
-    tickers = ['ZNC=F', 'ZNC.L', 'SZI=F']
+    """使用 Yahoo v8 Chart API + 偽裝 Chrome Header，徹底解決 GitHub Actions IP 封鎖問題"""
+    tickers = ['ZNC=F', 'TZN=F', 'LZN=F']
+    headers = {
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            ' (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        ),
+        'Accept': (
+            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+        ),
+        'Accept-Language': 'en-US,en;q=0.5',
+    }
 
     for ticker in tickers:
         print(f'正在嘗試抓取 {ticker} 最新數據...')
+
+        # 方式 1：Yahoo v8 原生 API 直連 (最穩定，不受 yfinance 庫 BUG 影響)
         try:
-            # yf.download 比 Ticker().history 更穩定且自動處理抓取 Header
-            df = yf.download(
-                ticker, period='6m', progress=False, auto_adjust=True
-            )
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=6m&interval=1d'
+            res = requests.get(url, headers=headers, timeout=15)
 
-            # 處理 yfinance 新版可能產生的 MultiIndex 雙層欄位
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+            if res.status_code == 200:
+                data = res.json()
+                result = data['chart']['result'][0]
+                timestamps = result['timestamp']
+                quote = result['indicators']['quote'][0]
 
-            # 確保欄位包含 Open, High, Low, Close
-            required_cols = ['Open', 'High', 'Low', 'Close']
-            if not df.empty and all(col in df.columns for col in required_cols):
-                # 剔除全零或空值的無效列
-                df = df.dropna(subset=required_cols)
+                df = pd.DataFrame(
+                    {
+                        'Open': quote.get('open'),
+                        'High': quote.get('high'),
+                        'Low': quote.get('low'),
+                        'Close': quote.get('close'),
+                    },
+                    index=pd.to_datetime(timestamps, unit='s'),
+                )
+
+                # 剔除假日空值
+                df = df.dropna()
+
                 if len(df) >= 20:
                     print(
-                        f'成功獲取 {ticker} 數據！(共 {len(df)} 筆交易日紀錄)'
+                        f'✅ [API 直連] 成功獲取 {ticker} 數據！(共 {len(df)}'
+                        ' 筆紀錄)'
                     )
                     return df, ticker
         except Exception as e:
-            print(f'{ticker} 抓取失敗: {e}')
+            print(f'⚠️ {ticker} API 直連失敗: {e}')
+
+        # 方式 2：yfinance 備援機制
+        try:
+            import yfinance as yf
+
+            df_yf = yf.download(
+                ticker, period='6m', progress=False, auto_adjust=True
+            )
+
+            if isinstance(df_yf.columns, pd.MultiIndex):
+                df_yf.columns = [col[0] for col in df_yf.columns]
+
+            df_yf.columns = [str(c).capitalize() for c in df_yf.columns]
+
+            required = ['Open', 'High', 'Low', 'Close']
+            if all(col in df_yf.columns for col in required):
+                df_yf = df_yf.dropna(subset=required)
+                if len(df_yf) >= 20:
+                    print(f'✅ [yfinance] 成功獲取 {ticker} 數據！')
+                    return df_yf, ticker
+        except Exception as e:
+            print(f'⚠️ {ticker} yfinance 備援失敗: {e}')
 
     return pd.DataFrame(), None
 
 
 def calculate_all_indicators(df):
-    """計算 5 大技術指標：RSI(14)、上影線率、布林通道(20,2)、EMA50、ATR(14)"""
-    # 1. RSI (14)
+    """計算 5 大技術指標"""
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / (loss + 1e-9)
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    # 2. 布林通道 (20, 2)
     df['SMA20'] = df['Close'].rolling(window=20).mean()
     df['Std20'] = df['Close'].rolling(window=20).std()
     df['Upper_BB'] = df['SMA20'] + (df['Std20'] * 2)
     df['Lower_BB'] = df['SMA20'] - (df['Std20'] * 2)
 
-    # 3. 50日 EMA
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
 
-    # 4. ATR (14)
     high_low = df['High'] - df['Low']
     high_pc = (df['High'] - df['Close'].shift(1)).abs()
     low_pc = (df['Low'] - df['Close'].shift(1)).abs()
     tr = pd.concat([high_low, high_pc, low_pc], axis=1).max(axis=1)
     df['ATR14'] = tr.rolling(window=14).mean()
 
-    # 5. 上影線佔比 與 10日最高價
     upper_body = df[['Open', 'Close']].max(axis=1)
     upper_shadow = df['High'] - upper_body
     total_range = df['High'] - df['Low'] + 1e-9
@@ -76,7 +113,7 @@ def calculate_all_indicators(df):
 
 
 def generate_chart(df, ticker, filename='zinc_chart.png'):
-    """繪製帶有布林通道、EMA50 與 RSI 的 K 線圖"""
+    """繪製 K 線圖"""
     plot_df = df.tail(60).copy()
 
     add_plots = [
@@ -102,11 +139,7 @@ def generate_chart(df, ticker, filename='zinc_chart.png'):
 
     custom_style = mpf.make_mpf_style(
         base_mpf_style='charles',
-        rc={
-            'font.size': 9,
-            'axes.labelsize': 10,
-            'figure.titlesize': 12,
-        },
+        rc={'font.size': 9, 'axes.labelsize': 10, 'figure.titlesize': 12},
     )
 
     mpf.plot(
@@ -126,13 +159,9 @@ def analyze_and_notify():
     if not webhook_url:
         raise ValueError('錯誤：未設置 WEBHOOK_URL 環境變數。')
 
-    # 多代碼與多機制抓取數據
     df, active_ticker = fetch_zinc_data()
     if df.empty or active_ticker is None:
-        raise RuntimeError(
-            '錯誤：備用代碼庫全數失敗，無法獲取鋅期貨數據。請檢查網路或 Yahoo'
-            ' 服務狀態。'
-        )
+        raise RuntimeError('錯誤：所有數據源均無法獲取鋅期貨數據。')
 
     df = calculate_all_indicators(df)
     latest = df.iloc[-1]
@@ -266,8 +295,13 @@ def analyze_and_notify():
         res = requests.post(webhook_url, data=payload, files=files)
 
     res.raise_for_status()
-    print(f'成功使用 {active_ticker} 推送通知與圖表！回應碼：{res.status_code}')
+    print(f'🎉 成功使用 {active_ticker} 推送通知與圖表！回應碼：{res.status_code}')
 
 
 if __name__ == '__main__':
-    analyze_and_notify()
+    try:
+        analyze_and_notify()
+    except Exception as e:
+        print('❌ 程式執行失敗，詳細報錯如下：')
+        traceback.print_exc()
+        raise e
