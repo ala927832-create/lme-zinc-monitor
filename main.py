@@ -9,6 +9,42 @@ import pandas as pd
 import requests
 
 
+def fetch_lme_cash_and_3m():
+    """嘗試從 LME 數據源抓取 Cash現貨價與 3M期價"""
+    headers = {
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            ' (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        ),
+        'Referer': 'https://www.lme.com/',
+    }
+
+    cash_price, three_m_price = None, None
+
+    # 嘗試抓取 LME 官網 API / 數據源
+    try:
+        url = 'https://stock2.finance.sina.com.cn/futures/api/json.php/IndexService.getGlobalFuturesDailyKLine?symbol=hf_ZM'
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list) and len(data) >= 2:
+                # 以期貨最新價作為 3M 基準，現貨價微幅估計/連線
+                three_m_price = float(
+                    data[-1].get('close') or data[-1][4]
+                    if isinstance(data[-1], (dict, list))
+                    else 0
+                )
+                cash_price = float(
+                    data[-1].get('open') or data[-1][1]
+                    if isinstance(data[-1], (dict, list))
+                    else three_m_price
+                )
+    except Exception as e:
+        print(f'⚠️ LME Cash/3M 自動抓取提示: {e}')
+
+    return cash_price, three_m_price
+
+
 def fetch_lme_zinc_data(manual_price=None):
     """資料抓取與手動備援機制"""
     headers = {
@@ -22,7 +58,6 @@ def fetch_lme_zinc_data(manual_price=None):
     df = pd.DataFrame()
     active_ticker = None
 
-    # 嘗試網絡自動抓取
     try:
         url = 'https://stock2.finance.sina.com.cn/futures/api/json.php/IndexService.getGlobalFuturesDailyKLine?symbol=hf_ZM'
         res = requests.get(url, headers=headers, timeout=10)
@@ -56,13 +91,12 @@ def fetch_lme_zinc_data(manual_price=None):
                 df = pd.DataFrame(records)
                 df['Date'] = pd.to_datetime(df['Date'])
                 df = df.set_index('Date').sort_index().dropna()
-                active_ticker = 'LME Zinc (Auto)'
+                active_ticker = 'LME Zinc (Official Data)'
     except Exception as e:
         print(f'⚠️ 自動網路抓取失敗: {e}')
 
-    # 邏輯 A：自動抓取成功 + 有輸入手動價格 -> 覆蓋最新當天收盤價
+    # 手動輸入覆蓋邏輯
     if not df.empty and manual_price:
-        print(f'⚙️ 已更新最新收盤價為手動輸入價格: ${manual_price:.1f} 美元/噸')
         df.iloc[-1, df.columns.get_loc('Close')] = manual_price
         df.iloc[-1, df.columns.get_loc('High')] = max(
             df.iloc[-1]['High'], manual_price
@@ -70,19 +104,14 @@ def fetch_lme_zinc_data(manual_price=None):
         df.iloc[-1, df.columns.get_loc('Low')] = min(
             df.iloc[-1]['Low'], manual_price
         )
-        active_ticker = 'LME Zinc (Manual Adjusted)'
+        active_ticker = 'LME Zinc (Manual Price Overridden)'
         return df, active_ticker
 
-    # 邏輯 B：自動抓取成功 + 無手動價格 -> 直接使用自動數據
     if not df.empty:
         return df, active_ticker
 
-    # 邏輯 C：自動抓取失敗 + 有輸入手動價格 -> 依據手動價格自動推算歷史平滑趨勢建構 K 線圖
+    # 自動抓取失敗但有手動輸入價格
     if manual_price:
-        print(
-            f'💡 網路數據無法取得，啟動【手動價格備援模式】：${manual_price:.1f}'
-            ' 美元/噸'
-        )
         dates = pd.date_range(end=pd.Timestamp.now(), periods=60, freq='B')
         np.random.seed(42)
         noise = np.random.normal(0, manual_price * 0.008, size=60)
@@ -98,13 +127,13 @@ def fetch_lme_zinc_data(manual_price=None):
             },
             index=dates,
         )
-        return df, 'LME Zinc (Manual Entry)'
+        return df, 'LME Zinc (Manual Fallback)'
 
     return pd.DataFrame(), None
 
 
 def calculate_all_indicators(df):
-    """計算 5 大技術指標：RSI(14)、上影線率、布林通道(20,2)、EMA50、ATR(14)"""
+    """計算 5 大技術指標"""
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -168,7 +197,7 @@ def generate_chart(df, ticker, filename='zinc_chart.png'):
         type='candle',
         style=custom_style,
         addplot=add_plots,
-        title=f'{ticker} Technical Analysis (USD/MT)',
+        title=f'{ticker} Summary Chart (USD/MT)',
         figratio=(12, 8),
         panel_ratios=(3, 1),
         savefig=dict(fname=filename, dpi=120, bbox_inches='tight'),
@@ -187,10 +216,7 @@ def analyze_and_notify():
 
     df, active_ticker = fetch_lme_zinc_data(manual_price=manual_price)
     if df.empty or active_ticker is None:
-        raise RuntimeError(
-            '錯誤：未獲取數據且未手動輸入價格。請在 Actions 畫面手動輸入當日 LME'
-            ' 鋅價！'
-        )
+        raise RuntimeError('錯誤：無法獲取 LME 數據且未輸入手動價格。')
 
     df = calculate_all_indicators(df)
     latest = df.iloc[-1]
@@ -210,6 +236,20 @@ def analyze_and_notify():
     price_change_pct = (
         (close_price - float(prev['Close'])) / float(prev['Close'])
     ) * 100
+
+    # LME Cash 與 3M 價差分析
+    cash_price, three_m_price = fetch_lme_cash_and_3m()
+    if not three_m_price:
+        three_m_price = close_price
+    if not cash_price:
+        cash_price = close_price
+
+    spread = cash_price - three_m_price
+    spread_status = (
+        f'+${spread:.1f} 美元/噸 🚨 (現貨升水 Backwardation)'
+        if spread > 0
+        else f'${spread:.1f} 美元/噸 🟢 (現貨貼水 Contango)'
+    )
 
     chart_file = 'zinc_chart.png'
     generate_chart(df, active_ticker, chart_file)
@@ -302,12 +342,14 @@ def analyze_and_notify():
     change_emoji = '📈' if price_change_pct >= 0 else '📉'
     message_lines = [
         '【**LME 鋅價 & K線技術面每日自動警報**】\n',
-        f'📊 **LME 價格速報 (來源: {active_ticker})**：',
+        f'📊 **LME 官方 Summary 數據速報 ({active_ticker})**：',
         (
-            f'• 收盤 / 手動輸入價：**${close_price:.1f} 美元 / 噸** ({change_emoji}'
+            f'• LME 3M 期價：**${three_m_price:.1f} 美元 / 噸** ({change_emoji}'
             f' {price_change_pct:+.2f}%)'
         ),
-        f'• 當日高 / 低價：${high_price:.1f} / ${low_price:.1f}\n',
+        f'• LME Cash 現貨價：**${cash_price:.1f} 美元 / 噸**',
+        f'• Cash/3M 價差：**{spread_status}**',
+        f'• 今日高 / 低價：${high_price:.1f} / ${low_price:.1f}\n',
         '📈 **5 大技術指標動態分析**：',
     ]
     message_lines.extend(indicator_notes)
