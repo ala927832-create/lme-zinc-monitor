@@ -7,9 +7,25 @@ import requests
 import yfinance as yf
 
 
+def fetch_zinc_data():
+    """嘗試多個 Yahoo Finance 鋅期貨代碼，確保能成功抓取數據"""
+    tickers = ['ZNC=F', 'TZN=F', 'LZN=F']
+    for ticker in tickers:
+        print(f'正在嘗試抓取 {ticker} 最新數據...')
+        try:
+            df = yf.Ticker(ticker).history(period='6m')
+            if not df.empty and len(df) >= 30:
+                print(f'成功獲取 {ticker} 數據！')
+                return df, ticker
+        except Exception as e:
+            print(f'{ticker} 抓取失敗: {e}')
+
+    return pd.DataFrame(), None
+
+
 def calculate_all_indicators(df):
     """計算 5 大技術指標：RSI(14)、上影線率、布林通道(20,2)、EMA50、ATR(14)"""
-    # 1. RSI (14) 相對強弱指標
+    # 1. RSI (14)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -22,17 +38,17 @@ def calculate_all_indicators(df):
     df['Upper_BB'] = df['SMA20'] + (df['Std20'] * 2)
     df['Lower_BB'] = df['SMA20'] - (df['Std20'] * 2)
 
-    # 3. 50日 EMA 均線
+    # 3. 50日 EMA
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
 
-    # 4. ATR (14) 波動率
+    # 4. ATR (14)
     high_low = df['High'] - df['Low']
     high_pc = (df['High'] - df['Close'].shift(1)).abs()
     low_pc = (df['Low'] - df['Close'].shift(1)).abs()
     tr = pd.concat([high_low, high_pc, low_pc], axis=1).max(axis=1)
     df['ATR14'] = tr.rolling(window=14).mean()
 
-    # 5. 上影線佔比 (Shooting Star 判斷) 與 10日最高價
+    # 5. 上影線佔比 與 10日最高價
     upper_body = df[['Open', 'Close']].max(axis=1)
     upper_shadow = df['High'] - upper_body
     total_range = df['High'] - df['Low'] + 1e-9
@@ -42,8 +58,8 @@ def calculate_all_indicators(df):
     return df
 
 
-def generate_chart(df, filename='zinc_chart.png'):
-    """使用 mplfinance 繪製帶有布林通道、EMA50 與 RSI 的 K 線圖"""
+def generate_chart(df, ticker, filename='zinc_chart.png'):
+    """繪製帶有布林通道、EMA50 與 RSI 的 K 線圖"""
     plot_df = df.tail(60).copy()
 
     add_plots = [
@@ -81,7 +97,7 @@ def generate_chart(df, filename='zinc_chart.png'):
         type='candle',
         style=custom_style,
         addplot=add_plots,
-        title='LME Zinc (ZNC=F) Technical Analysis',
+        title=f'LME Zinc ({ticker}) Technical Analysis',
         figratio=(12, 8),
         panel_ratios=(3, 1),
         savefig=dict(fname=filename, dpi=120, bbox_inches='tight'),
@@ -91,15 +107,12 @@ def generate_chart(df, filename='zinc_chart.png'):
 def analyze_and_notify():
     webhook_url = os.environ.get('WEBHOOK_URL')
     if not webhook_url:
-        raise ValueError(
-            '錯誤：未設置 WEBHOOK_URL 環境變數，請在 GitHub Secrets 中進行設定。'
-        )
+        raise ValueError('錯誤：未設置 WEBHOOK_URL 環境變數。')
 
-    ticker = 'ZNC=F'
-    print(f'正在抓取 {ticker} 最新數據...')
-    df = yf.Ticker(ticker).history(period='6m')
-    if df.empty:
-        raise RuntimeError(f'錯誤：無法從 Yahoo Finance 獲取 {ticker} 歷史數據。')
+    # 多代碼自動備援抓取
+    df, active_ticker = fetch_zinc_data()
+    if df.empty or active_ticker is None:
+        raise RuntimeError('錯誤：備用代碼庫全數失敗，無法獲取鋅期貨數據。')
 
     df = calculate_all_indicators(df)
     latest = df.iloc[-1]
@@ -121,10 +134,9 @@ def analyze_and_notify():
     ) * 100
 
     chart_file = 'zinc_chart.png'
-    generate_chart(df, chart_file)
+    generate_chart(df, active_ticker, chart_file)
 
     indicator_notes = []
-
     if rsi > 70:
         indicator_notes.append(
             f'• **RSI (14)**：{rsi:.1f} ⚠️ (進入 >70 超買區，過熱警戒)'
@@ -212,7 +224,7 @@ def analyze_and_notify():
     change_emoji = '📈' if price_change_pct >= 0 else '📉'
     message_lines = [
         '【**LME 鋅價 & K線技術面每日自動警報**】\n',
-        '📊 **價格與技術面速報**：',
+        f'📊 **價格速報 (標的: {active_ticker})**：',
         (
             f'• 最新收盤價：**${close_price:.1f} / 噸** ({change_emoji}'
             f' {price_change_pct:+.2f}%)'
@@ -234,7 +246,7 @@ def analyze_and_notify():
         res = requests.post(webhook_url, data=payload, files=files)
 
     res.raise_for_status()
-    print('全指標分析與圖表推送成功，回應碼：', res.status_code)
+    print(f'使用 {active_ticker} 成功發送數據與圖表！回應碼：{res.status_code}')
 
 
 if __name__ == '__main__':
