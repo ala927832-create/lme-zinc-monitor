@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       manual_cash_price:
-        description: '手動 LME Cash 價 (USD/噸，例如 2850)'
+        description: '請輸入當日 LME Cash 現貨價 (USD/噸，例如 2850)'
         required: false
-        default: ''
+        default: '2850'
 
 permissions:
   contents: write
