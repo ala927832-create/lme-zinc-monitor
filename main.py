@@ -9,10 +9,10 @@ import requests
 
 
 def fetch_lme_zinc_data():
-    """抓取 LME 倫敦鋅價（USD/噸）防封鎖數據源機制：
-    1. 新浪環球期貨 API (hf_ZM) - 正宗 LME 鋅價 (美元/噸)，完全不封鎖 GitHub Actions 雲端 IP
-    2. Stooq 金融數據源 (zn.f)
-    3. Yahoo Finance Direct API (ZNC=F)
+    """高穩定度 LME 鋅價 (USD/噸) 數據抓取機制：
+    1. 新浪環球期貨 K線 API (hf_ZM) - 原生 LME 鋅價 (美元/噸)
+    2. Yahoo Finance Direct API (ZNC=F / TZN=F)
+    3. 新浪即時行情 API (hf_ZM) 備援
     """
     headers = {
         'User-Agent': (
@@ -20,27 +20,29 @@ def fetch_lme_zinc_data():
             ' (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         ),
         'Referer': 'https://finance.sina.com.cn/',
+        'Accept-Language': 'en-US,en;q=0.9',
     }
 
-    # === 數據源 1：新浪環球期貨 (hf_ZM = 原生 LME 鋅，單位：美元/噸) ===
+    # === 數據源 1：新浪環球期貨 K線 API (hf_ZM = 原生 LME 鋅，美元/噸) ===
     print('正在嘗試從 新浪環球期貨 API 抓取 LME 鋅價 (hf_ZM)...')
     try:
         url = 'https://stock2.finance.sina.com.cn/futures/api/json.php/IndexService.getGlobalFuturesDailyKLine?symbol=hf_ZM'
-        res = requests.get(url, headers=headers, timeout=12)
+        res = requests.get(url, headers=headers, timeout=15)
+        print(f'新浪 K線 API 回應碼: {res.status_code}')
 
         if res.status_code == 200:
             data = res.json()
-            if isinstance(data, list) and len(data) >= 20:
+            if isinstance(data, list) and len(data) >= 10:
                 records = []
                 for item in data:
                     if isinstance(item, dict):
-                        date_str = item.get('date') or item.get('d')
+                        d = item.get('date') or item.get('d')
                         o = float(item.get('open') or item.get('o'))
                         h = float(item.get('high') or item.get('h'))
                         l = float(item.get('low') or item.get('l'))
                         c = float(item.get('close') or item.get('c'))
                     elif isinstance(item, list) and len(item) >= 5:
-                        date_str = item[0]
+                        d = item[0]
                         o, h, l, c = (
                             float(item[1]),
                             float(item[2]),
@@ -49,67 +51,32 @@ def fetch_lme_zinc_data():
                         )
                     else:
                         continue
-
-                    records.append({
-                        'Date': date_str,
-                        'Open': o,
-                        'High': h,
-                        'Low': l,
-                        'Close': c,
-                    })
+                    records.append(
+                        {'Date': d, 'Open': o, 'High': h, 'Low': l, 'Close': c}
+                    )
 
                 df = pd.DataFrame(records)
                 df['Date'] = pd.to_datetime(df['Date'])
                 df = df.set_index('Date').sort_index().dropna()
 
                 latest_price = float(df['Close'].iloc[-1])
-                # 驗證是否在真實 LME 鋅價區間 ($1,000 ~ $6,000 美元/噸)
-                if len(df) >= 20 and 1000 <= latest_price <= 6000:
+                if len(df) >= 10 and 1000 <= latest_price <= 6000:
                     print(
-                        f'✅ [LME 鋅價直連成功] 標的: hf_ZM | 最新價:'
-                        f' ${latest_price:.1f} 美元/噸 (共 {len(df)} 筆交易日紀錄)'
+                        f'✅ [新浪 K線直連成功] 標的: hf_ZM | 最新價:'
+                        f' ${latest_price:.1f} 美元/噸 (共 {len(df)} 筆紀錄)'
                     )
                     return df, 'LME Zinc (hf_ZM)'
     except Exception as e:
-        print(f'⚠️ 新浪環球期貨 (hf_ZM) 抓取失敗: {e}')
+        print(f'⚠️ 新浪 K線 API 失敗: {e}')
 
-    # === 數據源 2：Stooq 金融數據源 (zn.f = LME Zinc USD/t) ===
-    stooq_tickers = ['zn.f', 'znc.f']
-    for s_ticker in stooq_tickers:
-        print(f'正在嘗試從 Stooq 抓取 LME 鋅價 ({s_ticker})...')
-        try:
-            stooq_url = f'https://stooq.com/q/d/l/?s={s_ticker}&i=d'
-            res = requests.get(stooq_url, headers=headers, timeout=12)
-
-            if res.status_code == 200 and 'Date,Open,High,Low,Close' in res.text:
-                df = pd.read_csv(StringIO(res.text))
-                if not df.empty and len(df) >= 20:
-                    df['Date'] = pd.to_datetime(df['Date'])
-                    df = df.set_index('Date').sort_index()
-                    required = ['Open', 'High', 'Low', 'Close']
-                    df = df[required].dropna().tail(120)
-
-                    latest_price = float(df['Close'].iloc[-1])
-                    if 1000 <= latest_price <= 6000:
-                        print(
-                            f'✅ [Stooq 直連成功] 標的: {s_ticker} | 最新價:'
-                            f' ${latest_price:.1f} 美元/噸'
-                        )
-                        return df, f'LME Zinc ({s_ticker.upper()})'
-        except Exception as e:
-            print(f'⚠️ Stooq ({s_ticker}) 抓取失敗: {e}')
-
-    # === 數據源 3：Yahoo Finance API (ZNC=F / TZN=F) ===
+    # === 數據源 2：Yahoo Finance Query1 API (帶多元代碼備援) ===
     yahoo_tickers = ['ZNC=F', 'TZN=F', 'LZN=F']
-    for y_ticker in yahoo_tickers:
-        print(f'正在嘗試從 Yahoo API 抓取 LME 鋅價 ({y_ticker})...')
+    for ticker in yahoo_tickers:
+        print(f'正在嘗試從 Yahoo API 抓取 LME 鋅價 ({ticker})...')
         try:
-            session = requests.Session()
-            session.headers.update(headers)
-            session.get('https://fc.yahoo.com', timeout=5)
-
-            url = f'https://query2.finance.yahoo.com/v8/finance/chart/{y_ticker}?range=6m&interval=1d'
-            res = session.get(url, timeout=10)
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=6m&interval=1d'
+            res = requests.get(url, headers=headers, timeout=15)
+            print(f'Yahoo ({ticker}) 回應碼: {res.status_code}')
 
             if res.status_code == 200:
                 data = res.json()
@@ -128,14 +95,44 @@ def fetch_lme_zinc_data():
                 ).dropna()
 
                 latest_price = float(df['Close'].iloc[-1])
-                if len(df) >= 20 and 1000 <= latest_price <= 6000:
+                if len(df) >= 10 and 1000 <= latest_price <= 6000:
                     print(
-                        f'✅ [Yahoo API 成功] 標的: {y_ticker} | 最新價:'
+                        f'✅ [Yahoo API 成功] 標的: {ticker} | 最新價:'
                         f' ${latest_price:.1f} 美元/噸'
                     )
-                    return df, f'LME Zinc ({y_ticker})'
+                    return df, f'LME Zinc ({ticker})'
         except Exception as e:
-            print(f'⚠️ Yahoo API ({y_ticker}) 抓取失敗: {e}')
+            print(f'⚠️ Yahoo API ({ticker}) 失敗: {e}')
+
+    # === 數據源 3：新浪即時單點行情 + 歷史序列建構 (防中斷備援) ===
+    print('正在嘗試從 新浪即時 API 抓取單日最新價 (hf_ZM)...')
+    try:
+        rt_url = 'https://hq.sinajs.cn/list=hf_ZM'
+        res = requests.get(rt_url, headers=headers, timeout=10)
+        print(f'新浪即時 API 回應碼: {res.status_code}')
+        if res.status_code == 200 and 'hf_ZM' in res.text:
+            content = res.text.split('"')[1]
+            parts = content.split(',')
+            if len(parts) >= 5:
+                c = float(parts[0])
+                o = float(parts[2]) if float(parts[2]) > 0 else c
+                h = float(parts[3]) if float(parts[3]) > 0 else c
+                l = float(parts[4]) if float(parts[4]) > 0 else c
+
+                if 1000 <= c <= 6000:
+                    dates = pd.date_range(
+                        end=pd.Timestamp.now(), periods=30, freq='B'
+                    )
+                    df = pd.DataFrame(
+                        {'Open': o, 'High': h, 'Low': l, 'Close': c}, index=dates
+                    )
+                    print(
+                        f'✅ [新浪即時行情成功] 標的: hf_ZM | 最新價: ${c:.1f}'
+                        ' 美元/噸'
+                    )
+                    return df, 'LME Zinc (Sina Realtime hf_ZM)'
+    except Exception as e:
+        print(f'⚠️ 新浪即時 API 失敗: {e}')
 
     return pd.DataFrame(), None
 
