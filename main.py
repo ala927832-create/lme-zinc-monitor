@@ -1,6 +1,7 @@
 from io import StringIO
 import json
 import os
+import re
 import traceback
 import matplotlib.pyplot as plt
 import mplfinance as mpf
@@ -9,58 +10,89 @@ import requests
 
 
 def fetch_zinc_data():
-    """多重數據源抓取機制：
-    1. 優先使用 Stooq 金融數據源 (免 API Key，完全不阻擋 GitHub Actions 雲端 IP)
-    2. Yahoo Finance query2/v8 API 作為次要備援
+    """三大防封鎖數據源抽換機制：
+    1. 新浪財經 (Sina Finance ZN0) - 完全開放、不封鎖 GitHub Actions 雲端 IP
+    2. Yahoo Finance (帶 Cookie & Crumb 驗證機制)
+    3. Stooq 金融數據源
     """
     headers = {
         'User-Agent': (
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             ' (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-        )
+        ),
+        'Referer': 'https://finance.sina.com.cn/',
     }
 
-    # === 數據源 1：Stooq 金融數據 (對雲端 Runner 最友好的數據源) ===
-    stooq_tickers = ['zn.f', 'znc.f']
-    for s_ticker in stooq_tickers:
-        print(f'正在嘗試從 Stooq 抓取 {s_ticker} 最新數據...')
+    # === 數據源 1：新浪財經 滬鋅主力期貨 (ZN0) ===
+    print('正在嘗試從 新浪財經 API 抓取鋅期貨 K 線數據...')
+    try:
+        # 1.1 取得美金對人民幣匯率 (用於折算美元/噸)
+        usdcny_rate = 7.20  # 預設基準匯率
         try:
-            stooq_url = f'https://stooq.com/q/d/l/?s={s_ticker}&i=d'
-            res = requests.get(stooq_url, headers=headers, timeout=15)
-            if res.status_code == 200 and 'Date,Open,High,Low,Close' in res.text:
-                df = pd.read_csv(StringIO(res.text))
-                if not df.empty and len(df) >= 20:
-                    df['Date'] = pd.to_datetime(df['Date'])
-                    df = df.set_index('Date').sort_index()
+            fx_res = requests.get(
+                'https://hq.sinajs.cn/list=fx_susdcnyn',
+                headers=headers,
+                timeout=5,
+            )
+            if fx_res.status_code == 200 and 'fx_susdcnyn' in fx_res.text:
+                parts = fx_res.text.split(',')
+                if len(parts) > 8 and float(parts[8]) > 0:
+                    usdcny_rate = float(parts[8])
+                    print(f'最新 USD/CNY 匯率：{usdcny_rate}')
+        except Exception:
+            print(f'使用預設 USD/CNY 匯率：{usdcny_rate}')
 
-                    # 確保包含所需欄位並剔除空值
-                    required = ['Open', 'High', 'Low', 'Close']
-                    df = df[required].dropna()
+        # 1.2 抓取滬鋅主力日 K 線 (約 120 交易日)
+        sina_url = 'https://stock2.finance.sina.com.cn/futures/api/json.php/IndexService.getInnerFuturesDailyKLine?symbol=ZN0'
+        res = requests.get(sina_url, headers=headers, timeout=10)
 
-                    # 取近半年 (約 120 個交易日) 數據
-                    df = df.tail(120)
+        if res.status_code == 200:
+            raw_data = res.json()
+            if isinstance(raw_data, list) and len(raw_data) >= 20:
+                # raw_data 格式: [["2026-09-10", "open", "high", "low", "close", "volume"], ...]
+                df = pd.DataFrame(
+                    raw_data,
+                    columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'],
+                )
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.set_index('Date').sort_index()
 
-                    # 防呆檢查：當前鋅價應大於 $500 美元
-                    if float(df['Close'].iloc[-1]) > 500:
-                        print(
-                            f'✅ [Stooq 直連成功] 獲取 {s_ticker} 數據！(共'
-                            f' {len(df)} 筆紀錄)'
-                        )
-                        return df, f'LME-Zinc ({s_ticker.upper()})'
-        except Exception as e:
-            print(f'⚠️ Stooq ({s_ticker}) 抓取失敗: {e}')
+                cols = ['Open', 'High', 'Low', 'Close']
+                for c in cols:
+                    # 將人民幣/噸折算為 美元/噸 (RMB / Rate)
+                    df[c] = df[c].astype(float) / usdcny_rate
 
-    # === 數據源 2：Yahoo Finance query2 API (次要備援) ===
+                df = df[cols].dropna().tail(120)
+                print(
+                    f'✅ [新浪財經直連成功] 獲取 滬鋅主力(ZN0) 數據！(共 {len(df)}'
+                    ' 筆紀錄)'
+                )
+                return df, 'SHFE-Zinc (Sina ZN0)'
+    except Exception as e:
+        print(f'⚠️ 新浪財經 API 抓取失敗: {e}')
+
+    # === 數據源 2：Yahoo Finance (帶 Session Cookie & Crumb) ===
     yahoo_tickers = ['ZNC=F', 'TZN=F', 'LZN=F']
     for y_ticker in yahoo_tickers:
-        print(f'正在嘗試從 Yahoo API 抓取 {y_ticker} 數據...')
+        print(f'正在嘗試從 Yahoo API (Crumb 模式) 抓取 {y_ticker}...')
         try:
             session = requests.Session()
             session.headers.update(headers)
+
+            # 取得 Cookie
             session.get('https://fc.yahoo.com', timeout=5)
 
+            # 取得 Crumb
+            crumb_res = session.get(
+                'https://query1.finance.yahoo.com/v1/test/getcrumb', timeout=5
+            )
+            crumb = crumb_res.text.strip() if crumb_res.status_code == 200 else ''
+
             url = f'https://query2.finance.yahoo.com/v8/finance/chart/{y_ticker}?range=6m&interval=1d'
-            res = session.get(url, timeout=15)
+            if crumb:
+                url += f'&crumb={crumb}'
+
+            res = session.get(url, timeout=10)
             if res.status_code == 200:
                 data = res.json()
                 result = data['chart']['result'][0]
@@ -81,7 +113,23 @@ def fetch_zinc_data():
                     print(f'✅ [Yahoo API 成功] 獲取 {y_ticker} 數據！')
                     return df, y_ticker
         except Exception as e:
-            print(f'⚠️ Yahoo API ({y_ticker}) 抓取失敗: {e}')
+            print(f'⚠️ Yahoo API ({y_ticker}) 失敗: {e}')
+
+    # === 數據源 3：Stooq 金融數據 ===
+    print('正在嘗試從 Stooq 抓取 zn.f 最新數據...')
+    try:
+        stooq_url = 'https://stooq.com/q/d/l/?s=zn.f&i=d'
+        res = requests.get(stooq_url, headers=headers, timeout=10)
+        if res.status_code == 200 and 'Date,Open,High,Low,Close' in res.text:
+            df = pd.read_csv(StringIO(res.text))
+            if not df.empty and len(df) >= 20:
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.set_index('Date').sort_index()
+                df = df[['Open', 'High', 'Low', 'Close']].dropna().tail(120)
+                print(f'✅ [Stooq 直連成功] 獲取 zn.f 數據！')
+                return df, 'LME-Zinc (Stooq ZN.F)'
+    except Exception as e:
+        print(f'⚠️ Stooq 抓取失敗: {e}')
 
     return pd.DataFrame(), None
 
@@ -156,7 +204,7 @@ def generate_chart(df, ticker, filename='zinc_chart.png'):
         type='candle',
         style=custom_style,
         addplot=add_plots,
-        title=f'LME Zinc ({ticker}) Technical Analysis',
+        title=f'Zinc Futures ({ticker}) Technical Analysis',
         figratio=(12, 8),
         panel_ratios=(3, 1),
         savefig=dict(fname=filename, dpi=120, bbox_inches='tight'),
@@ -284,7 +332,7 @@ def analyze_and_notify():
         '【**LME 鋅價 & K線技術面每日自動警報**】\n',
         f'📊 **價格速報 (標的: {active_ticker})**：',
         (
-            f'• 最新收盤價：**${close_price:.1f} / 噸** ({change_emoji}'
+            f'• 最新估算收盤價：**${close_price:.1f} / 噸** ({change_emoji}'
             f' {price_change_pct:+.2f}%)'
         ),
         f'• 今日高 / 低價：${high_price:.1f} / ${low_price:.1f}\n',
