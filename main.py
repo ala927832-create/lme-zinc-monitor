@@ -91,14 +91,15 @@ def generate_chart(df, filename='zinc_chart.png'):
 def analyze_and_notify():
     webhook_url = os.environ.get('WEBHOOK_URL')
     if not webhook_url:
-        print('錯誤：未設置 WEBHOOK_URL')
-        return
+        raise ValueError(
+            '錯誤：未設置 WEBHOOK_URL 環境變數，請在 GitHub Secrets 中進行設定。'
+        )
 
     ticker = 'ZNC=F'
+    print(f'正在抓取 {ticker} 最新數據...')
     df = yf.Ticker(ticker).history(period='6m')
     if df.empty:
-        print('無法獲取歷史數據。')
-        return
+        raise RuntimeError(f'錯誤：無法從 Yahoo Finance 獲取 {ticker} 歷史數據。')
 
     df = calculate_all_indicators(df)
     latest = df.iloc[-1]
@@ -119,14 +120,11 @@ def analyze_and_notify():
         (close_price - prev['Close']) / prev['Close']
     ) * 100
 
-    # 生成技術分析圖表
     chart_file = 'zinc_chart.png'
     generate_chart(df, chart_file)
 
-    # 1. 單一技術指標判定
     indicator_notes = []
 
-    # RSI (14)
     if rsi > 70:
         indicator_notes.append(
             f'• **RSI (14)**：{rsi:.1f} ⚠️ (進入 >70 超買區，過熱警戒)'
@@ -138,13 +136,12 @@ def analyze_and_notify():
     else:
         indicator_notes.append(f'• **RSI (14)**：{rsi:.1f} (中立區間)')
 
-    # K線上影線率 (Shooting Star)
     if shadow_ratio > 0.6 and is_10d_high:
         indicator_notes.append(
-            f'• **K線型態**：上影線佔比 **{shadow_ratio*100:.1f}%** ⚠️ (創10日新高後急拉回，流星線特徵)'
+            f'• **K線型態**：上影線佔比 **{shadow_ratio*100:.1f}%** ⚠️'
+            ' (創10日新高後急拉回，流星線特徵)'
         )
 
-    # 布林通道 (BB 20, 2)
     if close_price > upper_bb:
         indicator_notes.append(
             f'• **布林通道**：突破上軌 ${upper_bb:.1f} 🚀 (極端軋空或爆發點)'
@@ -154,24 +151,24 @@ def analyze_and_notify():
             f'• **布林通道**：跌破下軌 ${lower_bb:.1f} 📉 (尋求超跌支撐)'
         )
 
-    # 50日 EMA
     ema_diff = abs(close_price - ema50)
     if ema_diff <= 20:
         indicator_notes.append(
-            f'• **50日 EMA 支撐**：目前價格 (${close_price:.1f}) 接近 EMA50 支撐 (${ema50:.1f} ±$20) 🎯'
+            f'• **50日 EMA 支撐**：目前價格 (${close_price:.1f}) 接近 EMA50'
+            f' 支撐 (${ema50:.1f} ±$20) 🎯'
         )
     else:
         indicator_notes.append(
-            f'• **50日 EMA 支撐**：${ema50:.1f} (距離當前 ${close_price - ema50:+.1f})'
+            f'• **50日 EMA 支撐**：${ema50:.1f} (距離當前'
+            f' ${close_price - ema50:+.1f})'
         )
 
-    # ATR (14) 波動率
     if day_range > 2.0 * atr14:
         indicator_notes.append(
-            f'• **ATR 波動率**：單日振幅 ${day_range:.1f} > 2.0 × ATR (${atr14:.1f}) 💥 (劇烈洗盤行情)'
+            f'• **ATR 波動率**：單日振幅 ${day_range:.1f} > 2.0 × ATR'
+            f' (${atr14:.1f}) 💥 (劇烈洗盤行情)'
         )
 
-    # 2. 複合條件判定 (防止單一指標誤判)
     composite_alerts = []
     is_bull_trap = close_price > upper_bb and rsi > 70 and shadow_ratio > 0.6
     is_golden_dip = ema_diff <= 20 and rsi < 40
@@ -179,7 +176,8 @@ def analyze_and_notify():
     if is_bull_trap:
         composite_alerts.append(
             '🚨 **【複合警報：高位假突破 / 主力派發】**\n'
-            '突破布林上軌 + RSI>70 + 長上影線流星線觸發！極高機率為 Bull Trap。'
+            '突破布林上軌 + RSI>70 + 長上影線流星線觸發！極高機率為 Bull'
+            ' Trap。'
         )
 
     if is_golden_dip:
@@ -188,18 +186,21 @@ def analyze_and_notify():
             '價格拉回至 EMA50 支撐區且 RSI<40，下檔承接力道強。'
         )
 
-    # 3. 鍍鋅廠與投資者雙軌操作建議
     if is_bull_trap or (rsi > 70 and shadow_ratio > 0.5):
         advice = (
             '💡 **綜合操作建議**：\n'
-            '• **鍍鋅廠**：高位假突破機率高，建議僅執行 JIT 隨用隨買，切勿囤積高價庫存。\n'
-            '• **積極投資者**：動能衰竭浮現，可評估阻力區 Bear Put Spread 或高位做空策略。'
+            '• **鍍鋅廠**：高位假突破機率高，建議僅執行 JIT'
+            ' 隨用隨買，切勿囤積高價庫存。\n'
+            '• **積極投資者**：動能衰竭浮現，可評估阻力區 Bear Put Spread'
+            ' 或高位做空策略。'
         )
     elif is_golden_dip or rsi < 35:
         advice = (
             '💡 **綜合操作建議**：\n'
-            '• **鍍鋅廠**：價格進入關鍵支撐區，可果斷分批購入 30%–50% 安全庫存。\n'
-            '• **積極投資者**：觀察支撐區止跌訊號，可尋求做多或 Call Spread 佈局。'
+            '• **鍍鋅廠**：價格進入關鍵支撐區，可果斷分批購入 30%–50%'
+            ' 安全庫存。\n'
+            '• **積極投資者**：觀察支撐區止跌訊號，可尋求做多或 Call Spread'
+            ' 佈局。'
         )
     else:
         advice = (
@@ -208,12 +209,14 @@ def analyze_and_notify():
             '• **積極投資者**：維持觀望或使用無方向性期權組合（如區間賣出價差）。'
         )
 
-    # 4. 構建完整 Discord 通報訊息
     change_emoji = '📈' if price_change_pct >= 0 else '📉'
     message_lines = [
         '【**LME 鋅價 & K線技術面每日自動警報**】\n',
         '📊 **價格與技術面速報**：',
-        f'• 最新收盤價：**${close_price:.1f} / 噸** ({change_emoji} {price_change_pct:+.2f}%)',
+        (
+            f'• 最新收盤價：**${close_price:.1f} / 噸** ({change_emoji}'
+            f' {price_change_pct:+.2f}%)'
+        ),
         f'• 今日高 / 低價：${high_price:.1f} / ${low_price:.1f}\n',
         '📈 **5 大技術指標動態分析**：',
     ]
@@ -225,12 +228,12 @@ def analyze_and_notify():
     message_lines.append('\n' + advice)
     full_message = '\n'.join(message_lines)
 
-    # 5. 推送文字與 K 線圖至 Webhook
     with open(chart_file, 'rb') as f:
         payload = {'payload_json': json.dumps({'content': full_message})}
         files = {'file': (chart_file, f, 'image/png')}
         res = requests.post(webhook_url, data=payload, files=files)
 
+    res.raise_for_status()
     print('全指標分析與圖表推送成功，回應碼：', res.status_code)
 
 
