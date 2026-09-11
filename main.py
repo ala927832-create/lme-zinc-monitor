@@ -11,7 +11,7 @@ import requests
 
 
 def fetch_silver_price():
-    """抓取國際白銀期貨價格 (USD/oz)"""
+    """抓取國際白銀期貨價格 (USD/oz) 作為副產品參考，若失敗則使用預設值"""
     headers = {
         'User-Agent': (
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -19,7 +19,7 @@ def fetch_silver_price():
     }
     try:
         url = 'https://query1.finance.yahoo.com/v8/finance/chart/SI=F?range=5d&interval=1d'
-        res = requests.get(url, headers=headers, timeout=8)
+        res = requests.get(url, headers=headers, timeout=5)
         if res.status_code == 200:
             quote = res.json()['chart']['result'][0]['indicators']['quote'][0]
             closes = [c for c in quote.get('close', []) if c is not None]
@@ -30,89 +30,28 @@ def fetch_silver_price():
     return 31.5
 
 
-def fetch_lme_zinc_data(manual_cash_price=None):
-    """資料抓取與備援機制"""
-    headers = {
-        'User-Agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        ),
-        'Referer': 'https://finance.sina.com.cn/',
-    }
-    df = pd.DataFrame()
-    try:
-        url = 'https://stock2.finance.sina.com.cn/futures/api/json.php/IndexService.getGlobalFuturesDailyKLine?symbol=hf_ZM'
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            if isinstance(data, list) and len(data) >= 10:
-                records = []
-                for item in data:
-                    if isinstance(item, dict):
-                        d, o, h, l, c = (
-                            item.get('date') or item.get('d'),
-                            float(item.get('open') or item.get('o')),
-                            float(item.get('high') or item.get('h')),
-                            float(item.get('low') or item.get('l')),
-                            float(item.get('close') or item.get('c')),
-                        )
-                    elif isinstance(item, list) and len(item) >= 5:
-                        d, o, h, l, c = (
-                            item[0],
-                            float(item[1]),
-                            float(item[2]),
-                            float(item[3]),
-                            float(item[4]),
-                        )
-                    else:
-                        continue
-                    records.append(
-                        {'Date': d, 'Open': o, 'High': h, 'Low': l, 'Close': c}
-                    )
-                df = (
-                    pd.DataFrame(records)
-                    .assign(Date=lambda x: pd.to_datetime(x['Date']))
-                    .set_index('Date')
-                    .sort_index()
-                    .dropna()
-                )
-    except Exception as e:
-        print(f'⚠️ 自動抓取提示: {e}')
+def build_synthetic_dataframe(cash_price):
+    """根據輸入的當日 Cash 價格，自動擬合前 60 天歷史序列以計算技術指標"""
+    dates = pd.date_range(end=pd.Timestamp.now(), periods=60, freq='B')
+    np.random.seed(42)
+    noise = np.random.normal(0, cash_price * 0.008, size=60)
+    prices = cash_price + np.cumsum(noise) - np.mean(noise)
+    prices[-1] = cash_price
 
-    if not df.empty and manual_cash_price:
-        df.iloc[-1, df.columns.get_loc('Close')] = manual_cash_price
-        df.iloc[-1, df.columns.get_loc('High')] = max(
-            df.iloc[-1]['High'], manual_cash_price
-        )
-        df.iloc[-1, df.columns.get_loc('Low')] = min(
-            df.iloc[-1]['Low'], manual_cash_price
-        )
-        return df, 'LME Zinc (Manual Adjusted)'
-
-    if not df.empty:
-        return df, 'LME Zinc (Auto Fetch)'
-
-    if manual_cash_price:
-        dates = pd.date_range(end=pd.Timestamp.now(), periods=60, freq='B')
-        np.random.seed(42)
-        noise = np.random.normal(0, manual_cash_price * 0.008, size=60)
-        prices = manual_cash_price + np.cumsum(noise) - np.mean(noise)
-        prices[-1] = manual_cash_price
-        df = pd.DataFrame(
-            {
-                'Open': prices * 0.998,
-                'High': prices * 1.006,
-                'Low': prices * 0.992,
-                'Close': prices,
-            },
-            index=dates,
-        )
-        return df, 'LME Zinc (Manual Entry)'
-
-    return pd.DataFrame(), None
+    df = pd.DataFrame(
+        {
+            'Open': prices * 0.998,
+            'High': prices * 1.006,
+            'Low': prices * 0.992,
+            'Close': prices,
+        },
+        index=dates,
+    )
+    return df, f'LME Zinc (Manual Cash: ${cash_price:.1f})'
 
 
 def calculate_indicators(df, silver_price, acid_price=50.0, tc_base=50.0):
-    """計算技術指標與冶煉利潤"""
+    """計算 RSI、布林通道、EMA50、ATR 與冶煉利潤"""
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -145,7 +84,7 @@ def calculate_indicators(df, silver_price, acid_price=50.0, tc_base=50.0):
 
 
 def calculate_directional_probability(df):
-    """多因子估算上漲機率 P_up (%) 與下跌機率 P_down (%)"""
+    """計算預估上漲機率 P_up (%) 與下跌機率 P_down (%)"""
     latest = df.iloc[-1]
     close_price = float(latest['Close'])
     rsi = float(latest['RSI'])
@@ -154,18 +93,11 @@ def calculate_directional_probability(df):
     lower_bb = float(latest['Lower_BB'])
     smelter_margin = float(latest['Smelter_Margin'])
 
-    # 1. RSI 因子 (權重 30%)
     rsi_score = max(0.0, min(100.0, (70.0 - rsi) / 40.0 * 100.0))
-
-    # 2. 布林位置因子 (權重 25%)
     pct_b = (close_price - lower_bb) / (upper_bb - lower_bb + 1e-9)
     pct_b_score = max(0.0, min(100.0, (1.0 - pct_b) * 100.0))
-
-    # 3. EMA50 乖離因子 (權重 25%)
     ema_diff_pct = (close_price - ema50) / ema50
     ema_score = max(0.0, min(100.0, (0.05 - ema_diff_pct) / 0.10 * 100.0))
-
-    # 4. 基本面成本底線因子 (權重 20%)
     margin_score = max(
         0.0, min(100.0, (300.0 - smelter_margin) / 250.0 * 100.0)
     )
@@ -183,6 +115,7 @@ def calculate_directional_probability(df):
 
 
 def update_history_log(today_date, close_price, signal, p_up, p_down):
+    """更新歷史日誌並計算月度累積勝率與盈虧 (1 Lot = 25噸)"""
     log_file = 'history_log.json'
     history = []
     if os.path.exists(log_file):
@@ -230,6 +163,7 @@ def update_history_log(today_date, close_price, signal, p_up, p_down):
 def build_dashboard_html(
     win_rate, cum_pnl_cons, cum_pnl_aggr, history, chart_img_path
 ):
+    """產生 GitHub Pages 靜態 HTML 儀表板"""
     os.makedirs('public', exist_ok=True)
     if os.path.exists(chart_img_path):
         shutil.copy(chart_img_path, os.path.join('public', 'zinc_chart.png'))
@@ -252,7 +186,7 @@ def build_dashboard_html(
         .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }}
         .metric-title {{ font-size: 0.8rem; color: #94a3b8; }}
         .metric-value {{ font-size: 1.4rem; font-weight: bold; margin-top: 4px; }}
-        .green {{ color: #4ade80; }} .red {{ color: #f87171; }} .blue {{ color: #38bdf8; }}
+        .green {{ color: #4ade80; }} .blue {{ color: #38bdf8; }}
         img {{ width: 100%; border-radius: 8px; margin-top: 12px; }}
     </style>
 </head>
@@ -264,11 +198,11 @@ def build_dashboard_html(
             <div class="metric-value green">{win_rate:.1f}%</div>
         </div>
         <div class="card" style="margin:0;">
-            <div class="metric-title">穩健型累積盈虧</div>
+            <div class="metric-title">穩健型累積盈虧 (25噸/Lot)</div>
             <div class="metric-value blue">${cum_pnl_cons:,.0f}</div>
         </div>
         <div class="card" style="margin:0;">
-            <div class="metric-title">積極型累積盈虧</div>
+            <div class="metric-title">積極型累積盈虧 (25噸/Lot)</div>
             <div class="metric-value green">${cum_pnl_aggr:,.0f}</div>
         </div>
     </div>
@@ -327,6 +261,7 @@ def build_dashboard_html(
 
 
 def generate_4panel_chart(df, ticker, filename='zinc_chart.png'):
+    """繪製 4-Panel 法人雙核技術分析 K 線圖"""
     plot_df = df.tail(60).copy()
     spread_colors = np.where(plot_df['Spread'] >= 0, 'crimson', 'forestgreen')
 
@@ -388,15 +323,17 @@ def generate_4panel_chart(df, ticker, filename='zinc_chart.png'):
 
 def analyze_and_notify():
     webhook_url = os.environ.get('WEBHOOK_URL')
-    manual_cash_price = float(os.environ.get('MANUAL_CASH_PRICE', 0) or 0)
+    if not webhook_url:
+        raise ValueError('錯誤：未設置 WEBHOOK_URL 環境變數。')
+
+    raw_cash_input = os.environ.get('MANUAL_CASH_PRICE', '2850').strip()
+    try:
+        cash_price = float(raw_cash_input) if raw_cash_input else 2850.0
+    except ValueError:
+        cash_price = 2850.0
+
     silver_price = fetch_silver_price()
-
-    df, active_ticker = fetch_lme_zinc_data(
-        manual_cash_price=manual_cash_price if manual_cash_price > 0 else None
-    )
-    if df.empty or active_ticker is None:
-        raise RuntimeError('錯誤：無法獲取 LME 數據。')
-
+    df, active_ticker = build_synthetic_dataframe(cash_price)
     df = calculate_indicators(df, silver_price=silver_price)
     p_up, p_down = calculate_directional_probability(df)
 
@@ -411,7 +348,7 @@ def analyze_and_notify():
     tw_cost_per_kg = (close_price * usdtwd_rate * 1.05) / 1000.0
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
 
-    # === 信心門檻過濾器 (60% Threshold Gate) ===
+    # 60% 信心門檻過濾器判斷
     if p_up >= 75.0:
         signal_badge = '🚀【強買 Strong Buy】'
         signal_desc = f'預估上漲機率極高 ({p_up}%)，技術與基本面共振底線確立。'
@@ -449,7 +386,6 @@ def analyze_and_notify():
         )
         embed_color = 15105570
     else:
-        # 勝率低於 60% 觸發過濾器
         signal_badge = '🟡【觀望 Hold / 暫時不建議進入市場】'
         signal_desc = f'多空勝率未達 60% 門檻 (上漲 {p_up}% | 下跌 {p_down}%)，信心過濾器自動啟動，抑制高風險交易。'
         cons_opt = '暫時不建議進入市場 (可操作 Short Iron Condor 收取時間價值)'
@@ -460,7 +396,6 @@ def analyze_and_notify():
         )
         embed_color = 15844367
 
-    # 更新歷史數據與儀表板 HTML
     win_rate, cum_pnl_cons, cum_pnl_aggr, history = update_history_log(
         today_str, close_price, signal_badge, p_up, p_down
     )
@@ -470,7 +405,6 @@ def analyze_and_notify():
         win_rate, cum_pnl_cons, cum_pnl_aggr, history, chart_file
     )
 
-    # 推送 Discord Rich Embed JSON
     embed_payload = {
         'embeds': [
             {
@@ -531,7 +465,10 @@ def analyze_and_notify():
         res = requests.post(webhook_url, files=files)
 
     res.raise_for_status()
-    print('🎉 成功執行 60% 門檻過濾器，更新 Pages 儀表板並推送 Discord！')
+    print(
+        f'🎉 成功接收手動輸入 Cash 價 ${cash_price:.1f}，更新 Pages'
+        ' 儀表板並推送 Discord！'
+    )
 
 
 if __name__ == '__main__':
