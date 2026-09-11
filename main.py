@@ -1,3 +1,4 @@
+from io import StringIO
 import json
 import os
 import traceback
@@ -8,27 +9,58 @@ import requests
 
 
 def fetch_zinc_data():
-    """使用 Yahoo v8 Chart API + 偽裝 Chrome Header，徹底解決 GitHub Actions IP 封鎖問題"""
-    tickers = ['ZNC=F', 'TZN=F', 'LZN=F']
+    """多重數據源抓取機制：
+    1. 優先使用 Stooq 金融數據源 (免 API Key，完全不阻擋 GitHub Actions 雲端 IP)
+    2. Yahoo Finance query2/v8 API 作為次要備援
+    """
     headers = {
         'User-Agent': (
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            ' (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        ),
-        'Accept': (
-            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
-        ),
-        'Accept-Language': 'en-US,en;q=0.5',
+            ' (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        )
     }
 
-    for ticker in tickers:
-        print(f'正在嘗試抓取 {ticker} 最新數據...')
-
-        # 方式 1：Yahoo v8 原生 API 直連 (最穩定，不受 yfinance 庫 BUG 影響)
+    # === 數據源 1：Stooq 金融數據 (對雲端 Runner 最友好的數據源) ===
+    stooq_tickers = ['zn.f', 'znc.f']
+    for s_ticker in stooq_tickers:
+        print(f'正在嘗試從 Stooq 抓取 {s_ticker} 最新數據...')
         try:
-            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=6m&interval=1d'
-            res = requests.get(url, headers=headers, timeout=15)
+            stooq_url = f'https://stooq.com/q/d/l/?s={s_ticker}&i=d'
+            res = requests.get(stooq_url, headers=headers, timeout=15)
+            if res.status_code == 200 and 'Date,Open,High,Low,Close' in res.text:
+                df = pd.read_csv(StringIO(res.text))
+                if not df.empty and len(df) >= 20:
+                    df['Date'] = pd.to_datetime(df['Date'])
+                    df = df.set_index('Date').sort_index()
 
+                    # 確保包含所需欄位並剔除空值
+                    required = ['Open', 'High', 'Low', 'Close']
+                    df = df[required].dropna()
+
+                    # 取近半年 (約 120 個交易日) 數據
+                    df = df.tail(120)
+
+                    # 防呆檢查：當前鋅價應大於 $500 美元
+                    if float(df['Close'].iloc[-1]) > 500:
+                        print(
+                            f'✅ [Stooq 直連成功] 獲取 {s_ticker} 數據！(共'
+                            f' {len(df)} 筆紀錄)'
+                        )
+                        return df, f'LME-Zinc ({s_ticker.upper()})'
+        except Exception as e:
+            print(f'⚠️ Stooq ({s_ticker}) 抓取失敗: {e}')
+
+    # === 數據源 2：Yahoo Finance query2 API (次要備援) ===
+    yahoo_tickers = ['ZNC=F', 'TZN=F', 'LZN=F']
+    for y_ticker in yahoo_tickers:
+        print(f'正在嘗試從 Yahoo API 抓取 {y_ticker} 數據...')
+        try:
+            session = requests.Session()
+            session.headers.update(headers)
+            session.get('https://fc.yahoo.com', timeout=5)
+
+            url = f'https://query2.finance.yahoo.com/v8/finance/chart/{y_ticker}?range=6m&interval=1d'
+            res = session.get(url, timeout=15)
             if res.status_code == 200:
                 data = res.json()
                 result = data['chart']['result'][0]
@@ -43,66 +75,43 @@ def fetch_zinc_data():
                         'Close': quote.get('close'),
                     },
                     index=pd.to_datetime(timestamps, unit='s'),
-                )
-
-                # 剔除假日空值
-                df = df.dropna()
+                ).dropna()
 
                 if len(df) >= 20:
-                    print(
-                        f'✅ [API 直連] 成功獲取 {ticker} 數據！(共 {len(df)}'
-                        ' 筆紀錄)'
-                    )
-                    return df, ticker
+                    print(f'✅ [Yahoo API 成功] 獲取 {y_ticker} 數據！')
+                    return df, y_ticker
         except Exception as e:
-            print(f'⚠️ {ticker} API 直連失敗: {e}')
-
-        # 方式 2：yfinance 備援機制
-        try:
-            import yfinance as yf
-
-            df_yf = yf.download(
-                ticker, period='6m', progress=False, auto_adjust=True
-            )
-
-            if isinstance(df_yf.columns, pd.MultiIndex):
-                df_yf.columns = [col[0] for col in df_yf.columns]
-
-            df_yf.columns = [str(c).capitalize() for c in df_yf.columns]
-
-            required = ['Open', 'High', 'Low', 'Close']
-            if all(col in df_yf.columns for col in required):
-                df_yf = df_yf.dropna(subset=required)
-                if len(df_yf) >= 20:
-                    print(f'✅ [yfinance] 成功獲取 {ticker} 數據！')
-                    return df_yf, ticker
-        except Exception as e:
-            print(f'⚠️ {ticker} yfinance 備援失敗: {e}')
+            print(f'⚠️ Yahoo API ({y_ticker}) 抓取失敗: {e}')
 
     return pd.DataFrame(), None
 
 
 def calculate_all_indicators(df):
-    """計算 5 大技術指標"""
+    """計算 5 大技術指標：RSI(14)、上影線率、布林通道(20,2)、EMA50、ATR(14)"""
+    # 1. RSI (14)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / (loss + 1e-9)
     df['RSI'] = 100 - (100 / (1 + rs))
 
+    # 2. 布林通道 (20, 2)
     df['SMA20'] = df['Close'].rolling(window=20).mean()
     df['Std20'] = df['Close'].rolling(window=20).std()
     df['Upper_BB'] = df['SMA20'] + (df['Std20'] * 2)
     df['Lower_BB'] = df['SMA20'] - (df['Std20'] * 2)
 
+    # 3. 50日 EMA
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
 
+    # 4. ATR (14)
     high_low = df['High'] - df['Low']
     high_pc = (df['High'] - df['Close'].shift(1)).abs()
     low_pc = (df['Low'] - df['Close'].shift(1)).abs()
     tr = pd.concat([high_low, high_pc, low_pc], axis=1).max(axis=1)
     df['ATR14'] = tr.rolling(window=14).mean()
 
+    # 5. 上影線佔比 與 10日最高價
     upper_body = df[['Open', 'Close']].max(axis=1)
     upper_shadow = df['High'] - upper_body
     total_range = df['High'] - df['Low'] + 1e-9
