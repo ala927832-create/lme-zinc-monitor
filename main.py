@@ -7,25 +7,43 @@ import requests
 import yfinance as yf
 
 
-def calculate_indicators(df):
-    """計算 RSI(14)、EMA(50) 與 布林通道(20, 2)"""
+def calculate_all_indicators(df):
+    """計算 5 大技術指標：RSI(14)、上影線率、布林通道(20,2)、EMA50、ATR(14)"""
+    # 1. RSI (14) 相對強弱指標
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / (loss + 1e-9)
     df['RSI'] = 100 - (100 / (1 + rs))
 
+    # 2. 布林通道 (20, 2)
     df['SMA20'] = df['Close'].rolling(window=20).mean()
     df['Std20'] = df['Close'].rolling(window=20).std()
     df['Upper_BB'] = df['SMA20'] + (df['Std20'] * 2)
     df['Lower_BB'] = df['SMA20'] - (df['Std20'] * 2)
 
+    # 3. 50日 EMA 均線
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+
+    # 4. ATR (14) 波動率
+    high_low = df['High'] - df['Low']
+    high_pc = (df['High'] - df['Close'].shift(1)).abs()
+    low_pc = (df['Low'] - df['Close'].shift(1)).abs()
+    tr = pd.concat([high_low, high_pc, low_pc], axis=1).max(axis=1)
+    df['ATR14'] = tr.rolling(window=14).mean()
+
+    # 5. 上影線佔比 (Shooting Star 判斷) 與 10日最高價
+    upper_body = df[['Open', 'Close']].max(axis=1)
+    upper_shadow = df['High'] - upper_body
+    total_range = df['High'] - df['Low'] + 1e-9
+    df['Shadow_Ratio'] = upper_shadow / total_range
+    df['Is_10D_High'] = df['High'] == df['High'].rolling(window=10).max()
+
     return df
 
 
 def generate_chart(df, filename='zinc_chart.png'):
-    """使用 mplfinance 繪製包含布林通道與 RSI 的 K 線圖"""
+    """使用 mplfinance 繪製帶有布林通道、EMA50 與 RSI 的 K 線圖"""
     plot_df = df.tail(60).copy()
 
     add_plots = [
@@ -34,7 +52,10 @@ def generate_chart(df, filename='zinc_chart.png'):
         ),
         mpf.make_addplot(plot_df['SMA20'], color='orange', width=1),
         mpf.make_addplot(
-            plot_df['Lower_BB'], color='forestgreen', linestyle='--', width=1
+            plot_df['Lower_BB'],
+            color='forestgreen',
+            linestyle='--',
+            width=1,
         ),
         mpf.make_addplot(plot_df['EMA50'], color='royalblue', width=1.2),
         mpf.make_addplot(
@@ -60,7 +81,7 @@ def generate_chart(df, filename='zinc_chart.png'):
         type='candle',
         style=custom_style,
         addplot=add_plots,
-        title='LME Zinc (ZNC=F) Daily K-Line Chart',
+        title='LME Zinc (ZNC=F) Technical Analysis',
         figratio=(12, 8),
         panel_ratios=(3, 1),
         savefig=dict(fname=filename, dpi=120, bbox_inches='tight'),
@@ -76,58 +97,141 @@ def analyze_and_notify():
     ticker = 'ZNC=F'
     df = yf.Ticker(ticker).history(period='6m')
     if df.empty:
-        print('無法抓取數據。')
+        print('無法獲取歷史數據。')
         return
 
-    df = calculate_indicators(df)
+    df = calculate_all_indicators(df)
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
     close_price = latest['Close']
+    high_price = latest['High']
+    low_price = latest['Low']
     rsi = latest['RSI']
     ema50 = latest['EMA50']
     upper_bb = latest['Upper_BB']
     lower_bb = latest['Lower_BB']
-    price_change_pct = ((close_price - prev['Close']) / prev['Close']) * 100
+    atr14 = latest['ATR14']
+    shadow_ratio = latest['Shadow_Ratio']
+    is_10d_high = latest['Is_10D_High']
+    day_range = high_price - low_price
+    price_change_pct = (
+        (close_price - prev['Close']) / prev['Close']
+    ) * 100
 
+    # 生成技術分析圖表
     chart_file = 'zinc_chart.png'
     generate_chart(df, chart_file)
 
-    alerts = []
-    if rsi >= 70:
-        alerts.append(f'⚠️ **RSI (14) 過熱**：{rsi:.1f} (>70 超買區)')
-    elif rsi <= 30:
-        alerts.append(f'🟢 **RSI (14) 超賣**：{rsi:.1f} (<30 超賣區)')
+    # 1. 單一技術指標判定
+    indicator_notes = []
 
-    if close_price >= upper_bb:
-        alerts.append(
-            f'🚀 **突破布林上軌**：收盤 ${close_price:.1f} 衝破上軌 ${upper_bb:.1f}'
+    # RSI (14)
+    if rsi > 70:
+        indicator_notes.append(
+            f'• **RSI (14)**：{rsi:.1f} ⚠️ (進入 >70 超買區，過熱警戒)'
         )
-    elif close_price <= lower_bb:
-        alerts.append(
-            f'📉 **跌破布林下軌**：收盤 ${close_price:.1f} 低於下軌 ${lower_bb:.1f}'
+    elif rsi < 30:
+        indicator_notes.append(
+            f'• **RSI (14)**：{rsi:.1f} 🟢 (進入 <30 超賣區，築底機會)'
+        )
+    else:
+        indicator_notes.append(f'• **RSI (14)**：{rsi:.1f} (中立區間)')
+
+    # K線上影線率 (Shooting Star)
+    if shadow_ratio > 0.6 and is_10d_high:
+        indicator_notes.append(
+            f'• **K線型態**：上影線佔比 **{shadow_ratio*100:.1f}%** ⚠️ (創10日新高後急拉回，流星線特徵)'
         )
 
+    # 布林通道 (BB 20, 2)
+    if close_price > upper_bb:
+        indicator_notes.append(
+            f'• **布林通道**：突破上軌 ${upper_bb:.1f} 🚀 (極端軋空或爆發點)'
+        )
+    elif close_price < lower_bb:
+        indicator_notes.append(
+            f'• **布林通道**：跌破下軌 ${lower_bb:.1f} 📉 (尋求超跌支撐)'
+        )
+
+    # 50日 EMA
+    ema_diff = abs(close_price - ema50)
+    if ema_diff <= 20:
+        indicator_notes.append(
+            f'• **50日 EMA 支撐**：目前價格 (${close_price:.1f}) 接近 EMA50 支撐 (${ema50:.1f} ±$20) 🎯'
+        )
+    else:
+        indicator_notes.append(
+            f'• **50日 EMA 支撐**：${ema50:.1f} (距離當前 ${close_price - ema50:+.1f})'
+        )
+
+    # ATR (14) 波動率
+    if day_range > 2.0 * atr14:
+        indicator_notes.append(
+            f'• **ATR 波動率**：單日振幅 ${day_range:.1f} > 2.0 × ATR (${atr14:.1f}) 💥 (劇烈洗盤行情)'
+        )
+
+    # 2. 複合條件判定 (防止單一指標誤判)
+    composite_alerts = []
+    is_bull_trap = close_price > upper_bb and rsi > 70 and shadow_ratio > 0.6
+    is_golden_dip = ema_diff <= 20 and rsi < 40
+
+    if is_bull_trap:
+        composite_alerts.append(
+            '🚨 **【複合警報：高位假突破 / 主力派發】**\n'
+            '突破布林上軌 + RSI>70 + 長上影線流星線觸發！極高機率為 Bull Trap。'
+        )
+
+    if is_golden_dip:
+        composite_alerts.append(
+            '🟢 **【複合警報：黃金補庫點 / 支撐確認】**\n'
+            '價格拉回至 EMA50 支撐區且 RSI<40，下檔承接力道強。'
+        )
+
+    # 3. 鍍鋅廠與投資者雙軌操作建議
+    if is_bull_trap or (rsi > 70 and shadow_ratio > 0.5):
+        advice = (
+            '💡 **綜合操作建議**：\n'
+            '• **鍍鋅廠**：高位假突破機率高，建議僅執行 JIT 隨用隨買，切勿囤積高價庫存。\n'
+            '• **積極投資者**：動能衰竭浮現，可評估阻力區 Bear Put Spread 或高位做空策略。'
+        )
+    elif is_golden_dip or rsi < 35:
+        advice = (
+            '💡 **綜合操作建議**：\n'
+            '• **鍍鋅廠**：價格進入關鍵支撐區，可果斷分批購入 30%–50% 安全庫存。\n'
+            '• **積極投資者**：觀察支撐區止跌訊號，可尋求做多或 Call Spread 佈局。'
+        )
+    else:
+        advice = (
+            '💡 **綜合操作建議**：\n'
+            '• **鍍鋅廠**：行情處於區間震盪，維繫 10–15 天常態營運庫存即可。\n'
+            '• **積極投資者**：維持觀望或使用無方向性期權組合（如區間賣出價差）。'
+        )
+
+    # 4. 構建完整 Discord 通報訊息
     change_emoji = '📈' if price_change_pct >= 0 else '📉'
     message_lines = [
-        '【**LME 鋅價 K 線圖與技術指標每日自動監控**】',
-        f'📊 **最新價**：**${close_price:.1f} / 噸** ({change_emoji} {price_change_pct:+.2f}%)',
-        f'• **RSI (14)**：{rsi:.1f} | **50日 EMA**：${ema50:.1f}',
-        f'• **布林通道**：[${lower_bb:.1f} ~ ${upper_bb:.1f}]',
+        '【**LME 鋅價 & K線技術面每日自動警報**】\n',
+        '📊 **價格與技術面速報**：',
+        f'• 最新收盤價：**${close_price:.1f} / 噸** ({change_emoji} {price_change_pct:+.2f}%)',
+        f'• 今日高 / 低價：${high_price:.1f} / ${low_price:.1f}\n',
+        '📈 **5 大技術指標動態分析**：',
     ]
+    message_lines.extend(indicator_notes)
 
-    if alerts:
-        message_lines.append('\n🚨 **指標預警**：')
-        message_lines.extend([f'• {a}' for a in alerts])
+    if composite_alerts:
+        message_lines.append('\n' + '\n'.join(composite_alerts))
 
+    message_lines.append('\n' + advice)
     full_message = '\n'.join(message_lines)
 
+    # 5. 推送文字與 K 線圖至 Webhook
     with open(chart_file, 'rb') as f:
         payload = {'payload_json': json.dumps({'content': full_message})}
         files = {'file': (chart_file, f, 'image/png')}
         res = requests.post(webhook_url, data=payload, files=files)
 
-    print('通知與圖表發送完成，回應碼：', res.status_code)
+    print('全指標分析與圖表推送成功，回應碼：', res.status_code)
 
 
 if __name__ == '__main__':
