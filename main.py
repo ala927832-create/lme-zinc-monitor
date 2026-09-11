@@ -8,15 +8,32 @@ import yfinance as yf
 
 
 def fetch_zinc_data():
-    """嘗試多個 Yahoo Finance 鋅期貨代碼，確保能成功抓取數據"""
-    tickers = ['ZNC=F', 'TZN=F', 'LZN=F']
+    """使用 yf.download 搭配多代碼自動備援，解決 GitHub Actions IP 阻擋與代碼失效問題"""
+    # 備援代碼清單：ZNC=F (LME鋅期貨), ZNC.L (倫敦鋅), SZI=F (上海鋅期貨折算)
+    tickers = ['ZNC=F', 'ZNC.L', 'SZI=F']
+
     for ticker in tickers:
         print(f'正在嘗試抓取 {ticker} 最新數據...')
         try:
-            df = yf.Ticker(ticker).history(period='6m')
-            if not df.empty and len(df) >= 30:
-                print(f'成功獲取 {ticker} 數據！')
-                return df, ticker
+            # yf.download 比 Ticker().history 更穩定且自動處理抓取 Header
+            df = yf.download(
+                ticker, period='6m', progress=False, auto_adjust=True
+            )
+
+            # 處理 yfinance 新版可能產生的 MultiIndex 雙層欄位
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            # 確保欄位包含 Open, High, Low, Close
+            required_cols = ['Open', 'High', 'Low', 'Close']
+            if not df.empty and all(col in df.columns for col in required_cols):
+                # 剔除全零或空值的無效列
+                df = df.dropna(subset=required_cols)
+                if len(df) >= 20:
+                    print(
+                        f'成功獲取 {ticker} 數據！(共 {len(df)} 筆交易日紀錄)'
+                    )
+                    return df, ticker
         except Exception as e:
             print(f'{ticker} 抓取失敗: {e}')
 
@@ -109,28 +126,31 @@ def analyze_and_notify():
     if not webhook_url:
         raise ValueError('錯誤：未設置 WEBHOOK_URL 環境變數。')
 
-    # 多代碼自動備援抓取
+    # 多代碼與多機制抓取數據
     df, active_ticker = fetch_zinc_data()
     if df.empty or active_ticker is None:
-        raise RuntimeError('錯誤：備用代碼庫全數失敗，無法獲取鋅期貨數據。')
+        raise RuntimeError(
+            '錯誤：備用代碼庫全數失敗，無法獲取鋅期貨數據。請檢查網路或 Yahoo'
+            ' 服務狀態。'
+        )
 
     df = calculate_all_indicators(df)
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    close_price = latest['Close']
-    high_price = latest['High']
-    low_price = latest['Low']
-    rsi = latest['RSI']
-    ema50 = latest['EMA50']
-    upper_bb = latest['Upper_BB']
-    lower_bb = latest['Lower_BB']
-    atr14 = latest['ATR14']
-    shadow_ratio = latest['Shadow_Ratio']
-    is_10d_high = latest['Is_10D_High']
+    close_price = float(latest['Close'])
+    high_price = float(latest['High'])
+    low_price = float(latest['Low'])
+    rsi = float(latest['RSI'])
+    ema50 = float(latest['EMA50'])
+    upper_bb = float(latest['Upper_BB'])
+    lower_bb = float(latest['Lower_BB'])
+    atr14 = float(latest['ATR14'])
+    shadow_ratio = float(latest['Shadow_Ratio'])
+    is_10d_high = bool(latest['Is_10D_High'])
     day_range = high_price - low_price
     price_change_pct = (
-        (close_price - prev['Close']) / prev['Close']
+        (close_price - float(prev['Close'])) / float(prev['Close'])
     ) * 100
 
     chart_file = 'zinc_chart.png'
@@ -246,7 +266,7 @@ def analyze_and_notify():
         res = requests.post(webhook_url, data=payload, files=files)
 
     res.raise_for_status()
-    print(f'使用 {active_ticker} 成功發送數據與圖表！回應碼：{res.status_code}')
+    print(f'成功使用 {active_ticker} 推送通知與圖表！回應碼：{res.status_code}')
 
 
 if __name__ == '__main__':
